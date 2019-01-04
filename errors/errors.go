@@ -1,8 +1,8 @@
 package errors
 
 import (
-	goerrors "github.com/go-errors/errors"
 	"fmt"
+	goerrors "github.com/go-errors/errors"
 )
 
 // Wrap the given error in an Error type that contains the stack trace. If the given error already has a stack trace,
@@ -18,7 +18,7 @@ func WithStackTrace(err error) error {
 // Wrap the given error in an Error type that contains the stack trace and has the given message prepended as part of
 // the error message. If the given error already has a stack trace, it is used directly. If the given error is nil,
 // return nil.
-func WithStackTraceAndPrefix(err error, message string, args ... interface{}) error {
+func WithStackTraceAndPrefix(err error, message string, args ...interface{}) error {
 	if err == nil {
 		return nil
 	}
@@ -54,7 +54,26 @@ func PrintErrorWithStackTrace(err error) string {
 	}
 
 	switch underlyingErr := err.(type) {
-	case *goerrors.Error: return underlyingErr.ErrorStack()
-	default: return err.Error()
+	case *goerrors.Error:
+		return underlyingErr.ErrorStack()
+	default:
+		return err.Error()
 	}
+}
+
+// A method that tries to recover from panics, and if it succeeds, calls the given onPanic function with an error that
+// explains the cause of the panic. This function should only be called from a defer statement.
+func Recover(onPanic func(cause error)) {
+	if rec := recover(); rec != nil {
+		err, isError := rec.(error)
+		if !isError {
+			err = fmt.Errorf("%v", rec)
+		}
+		onPanic(WithStackTrace(err))
+	}
+}
+
+// Interface to determine if we can retrieve an exit status from an error
+type IErrorCode interface {
+	ExitStatus() (int, error)
 }

@@ -5,8 +5,12 @@ owners:
 import:
 - package: github.com/urfave/cli
 - package: github.com/hashicorp/hcl
+- package: github.com/hashicorp/go-getter
+- package: github.com/hashicorp/go-version
 - package: github.com/stretchr/testify/assert
 - package: github.com/go-errors/errors
+- package: github.com/mitchellh/mapstructure
+- package: github.com/mattn/go-zglob
 - package: github.com/aws/aws-sdk-go
   subpackages:
   - aws
@@ -14,3 +18,5 @@ import:
   - aws/session
   - aws/awserr
   - aws/service/dynamodb
+  - aws/service/s3
+  - service/sts

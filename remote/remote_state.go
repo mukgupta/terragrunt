@@ -1,16 +1,40 @@
 package remote
 
 import (
-	"github.com/gruntwork-io/terragrunt/util"
-	"github.com/gruntwork-io/terragrunt/shell"
 	"fmt"
+	"reflect"
+	"strconv"
+
 	"github.com/gruntwork-io/terragrunt/errors"
+	"github.com/gruntwork-io/terragrunt/options"
+	"github.com/gruntwork-io/terragrunt/util"
 )
 
 // Configuration for Terraform remote state
 type RemoteState struct {
-	Backend        string
-	BackendConfigs map[string]string
+	Backend string                 `hcl:"backend"`
+	Config  map[string]interface{} `hcl:"config"`
+}
+
+func (remoteState *RemoteState) String() string {
+	return fmt.Sprintf("RemoteState{Backend = %v, Config = %v}", remoteState.Backend, remoteState.Config)
+}
+
+type RemoteStateInitializer interface {
+	// Return true if remote state needs to be initialized
+	NeedsInitialization(config map[string]interface{}, terragruntOptions *options.TerragruntOptions) (bool, error)
+
+	// Initialize the remote state
+	Initialize(config map[string]interface{}, terragruntOptions *options.TerragruntOptions) error
+
+	// Return the config that should be passed on to terraform via -backend-config cmd line param
+	// Allows the Backends to filter and/or modify the configuration given from the user
+	GetTerraformInitArgs(config map[string]interface{}) map[string]interface{}
+}
+
+// TODO: initialization actions for other remote state backends can be added here
+var remoteStateInitializers = map[string]RemoteStateInitializer{
+	"s3": S3Initializer{},
 }
 
 // Fill in any default configuration for remote state
@@ -24,22 +48,16 @@ func (remoteState *RemoteState) Validate() error {
 		return errors.WithStackTrace(RemoteBackendMissing)
 	}
 
-	// TODO: for the S3 backend, check that encryption is enabled
-	// TODO: for the S3 backend, use the AWS API to verify the S3 bucket has versioning enabled
-
 	return nil
 }
 
-// Configure Terraform remote state
-func (remoteState RemoteState) ConfigureRemoteState() error {
-	shouldConfigure, err := shouldConfigureRemoteState(remoteState)
-	if err != nil {
-		return err
-	}
-
-	if shouldConfigure {
-		util.Logger.Printf("Configuring remote state for the %s backend", remoteState.Backend)
-		return shell.RunShellCommand("terraform", remoteState.toTerraformRemoteConfigArgs()...)
+// Perform any actions necessary to initialize the remote state before it's used for storage. For example, if you're
+// using S3 for remote state storage, this may create the S3 bucket if it doesn't exist already.
+func (remoteState *RemoteState) Initialize(terragruntOptions *options.TerragruntOptions) error {
+	terragruntOptions.Logger.Printf("Initializing remote state for the %s backend", remoteState.Backend)
+	initializer, hasInitializer := remoteStateInitializers[remoteState.Backend]
+	if hasInitializer {
+		return initializer.Initialize(remoteState.Config, terragruntOptions)
 	}
 
 	return nil
@@ -48,43 +66,81 @@ func (remoteState RemoteState) ConfigureRemoteState() error {
 // Returns true if remote state needs to be configured. This will be the case when:
 //
 // 1. Remote state has not already been configured
-// 2. Remote state has been configured, but for a different backend type, and the user confirms it's OK to overwrite it.
-func shouldConfigureRemoteState(remoteStateFromTerragruntConfig RemoteState) (bool, error) {
-	state, err := ParseTerraformStateFileFromDefaultLocations()
+// 2. Remote state has been configured, but with a different configuration
+// 3. The remote state initializer for this backend type, if there is one, says initialization is necessary
+func (remoteState *RemoteState) NeedsInit(terragruntOptions *options.TerragruntOptions) (bool, error) {
+	state, err := ParseTerraformStateFileFromLocation(remoteState.Backend, remoteState.Config, terragruntOptions.WorkingDir)
 	if err != nil {
 		return false, err
 	}
 
-	if state.IsRemote() {
-		return shouldOverrideExistingRemoteState(state.Remote, remoteStateFromTerragruntConfig)
-	} else {
+	// Remote state not configured
+	if state == nil {
 		return true, nil
 	}
-}
 
-// Check if the remote state that is already configured matches the one specified in the Terragrunt config. If it does,
-// return false to indicate remote state does not need to be configured again. If it doesn't, prompt the user whether
-// we should override the existing remote state setting.
-func shouldOverrideExistingRemoteState(existingRemoteState *TerraformStateRemote, remoteStateFromTerragruntConfig RemoteState) (bool, error) {
-	if existingRemoteState.Type == remoteStateFromTerragruntConfig.Backend {
-		util.Logger.Printf("Remote state is already configured for backend %s", existingRemoteState.Type)
-		return false, nil
-	} else {
-		return shell.PromptUserForYesNo(fmt.Sprintf("WARNING: Terraform remote state is already configured, but for backend %s, whereas your Terragrunt configuration specifies %s. Overwrite?", existingRemoteState.Type, remoteStateFromTerragruntConfig.Backend))
+	// Remote state configured, but with a different configuration
+	if state.IsRemote() && remoteState.differsFrom(state.Backend, terragruntOptions) {
+		return true, nil
 	}
+
+	// Remote state initializer says initialization is necessary
+	initializer, hasInitializer := remoteStateInitializers[remoteState.Backend]
+	if hasInitializer {
+		return initializer.NeedsInitialization(remoteState.Config, terragruntOptions)
+	}
+
+	return false, nil
 }
 
-// Convert the RemoteState config into the format used by Terraform
-func (remoteState RemoteState) toTerraformRemoteConfigArgs() []string {
-	baseArgs := []string{"remote", "config", "-backend", remoteState.Backend}
+// Returns true if this remote state is different than the given remote state that is currently being used by terraform.
+func (remoteState *RemoteState) differsFrom(existingBackend *TerraformBackend, terragruntOptions *options.TerragruntOptions) bool {
+	if existingBackend.Type != remoteState.Backend {
+		terragruntOptions.Logger.Printf("Backend type has changed from %s to %s", existingBackend.Type, remoteState.Backend)
+		return true
+	}
 
-	backendConfigArgs := []string{}
-	for key, value := range remoteState.BackendConfigs {
-		arg := fmt.Sprintf("-backend-config=%s=%s", key, value)
+	// Terraform's `backend` configuration uses a boolean for the `encrypt` parameter. However, perhaps for backwards compatibility reasons,
+	// Terraform stores that parameter as a string in the `terraform.tfstate` file. Therefore, we have to convert it accordingly, or `DeepEqual`
+	// will fail.
+	if util.KindOf(existingBackend.Config["encrypt"]) == reflect.String && util.KindOf(remoteState.Config["encrypt"]) == reflect.Bool {
+		// If encrypt in remoteState is a bool and a string in existingBackend, DeepEqual will consider the maps to be different.
+		// So we convert the value from string to bool to make them equivalent.
+		if value, err := strconv.ParseBool(existingBackend.Config["encrypt"].(string)); err == nil {
+			existingBackend.Config["encrypt"] = value
+		} else {
+			terragruntOptions.Logger.Printf("Remote state configuration encrypt contains invalid value %v, should be boolean.", existingBackend.Config["encrypt"])
+		}
+	}
+
+	if !reflect.DeepEqual(existingBackend.Config, remoteState.Config) {
+		terragruntOptions.Logger.Printf("Backend config has changed from %s to %s", existingBackend.Config, remoteState.Config)
+		return true
+	}
+
+	terragruntOptions.Logger.Printf("Backend %s has not changed.", existingBackend.Type)
+	return false
+}
+
+// Convert the RemoteState config into the format used by the terraform init command
+func (remoteState RemoteState) ToTerraformInitArgs() []string {
+
+	config := remoteState.Config
+
+	initializer, hasInitializer := remoteStateInitializers[remoteState.Backend]
+	if hasInitializer {
+		// get modified config from backend, if backend exists
+		config = initializer.GetTerraformInitArgs(remoteState.Config)
+	}
+
+	var backendConfigArgs []string = nil
+
+	for key, value := range config {
+		arg := fmt.Sprintf("-backend-config=%s=%v", key, value)
 		backendConfigArgs = append(backendConfigArgs, arg)
 	}
 
-	return append(baseArgs, backendConfigArgs...)
+	return backendConfigArgs
 }
 
-var RemoteBackendMissing = fmt.Errorf("The remoteState.backend field cannot be empty")
+var RemoteBackendMissing = fmt.Errorf("The remote_state.backend field cannot be empty")

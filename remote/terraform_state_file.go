@@ -2,10 +2,10 @@ package remote
 
 import (
 	"encoding/json"
-	"io/ioutil"
-	"github.com/gruntwork-io/terragrunt/errors"
 	"fmt"
+	"github.com/gruntwork-io/terragrunt/errors"
 	"github.com/gruntwork-io/terragrunt/util"
+	"io/ioutil"
 )
 
 // TODO: this file could be changed to use the Terraform Go code to read state files, but that code is relatively
@@ -22,12 +22,12 @@ const DEFAULT_PATH_TO_REMOTE_STATE_FILE = ".terraform/terraform.tfstate"
 type TerraformState struct {
 	Version int
 	Serial  int
-	Remote  *TerraformStateRemote
+	Backend *TerraformBackend
 	Modules []TerraformStateModule
 }
 
-// The structure of the "remote" section of the Terraform .tfstate file
-type TerraformStateRemote struct {
+// The structure of the "backend" section of the Terraform .tfstate file
+type TerraformBackend struct {
 	Type   string
 	Config map[string]interface{}
 }
@@ -41,16 +41,21 @@ type TerraformStateModule struct {
 
 // Return true if this Terraform state is configured for remote state storage
 func (state *TerraformState) IsRemote() bool {
-	return state.Remote != nil
+	return state.Backend != nil && state.Backend.Type != "local"
 }
 
-// Parse the Terraform .tfstate file from its default locations. If the file doesn't exist at any of the default
-// locations, return nil.
-func ParseTerraformStateFileFromDefaultLocations() (*TerraformState, error) {
-	if util.FileExists(DEFAULT_PATH_TO_LOCAL_STATE_FILE) {
-		return ParseTerraformStateFile(DEFAULT_PATH_TO_LOCAL_STATE_FILE)
-	} else if util.FileExists(DEFAULT_PATH_TO_REMOTE_STATE_FILE) {
-		return ParseTerraformStateFile(DEFAULT_PATH_TO_REMOTE_STATE_FILE)
+// Parses the Terraform .tfstate file. If a local backend is used then search the given path, or
+// return nil if the file is missing. If the backend is not local then parse the Terraform .tfstate
+// file from the location specified by workingDir. If no location is specified, search the current
+// directory. If the file doesn't exist at any of the default locations, return nil.
+func ParseTerraformStateFileFromLocation(backend string, config map[string]interface{}, workingDir string) (*TerraformState, error) {
+	stateFile, ok := config["path"].(string)
+	if backend == "local" && ok && util.FileExists(stateFile) {
+		return ParseTerraformStateFile(stateFile)
+	} else if util.FileExists(util.JoinPath(workingDir, DEFAULT_PATH_TO_LOCAL_STATE_FILE)) {
+		return ParseTerraformStateFile(util.JoinPath(workingDir, DEFAULT_PATH_TO_LOCAL_STATE_FILE))
+	} else if util.FileExists(util.JoinPath(workingDir, DEFAULT_PATH_TO_REMOTE_STATE_FILE)) {
+		return ParseTerraformStateFile(util.JoinPath(workingDir, DEFAULT_PATH_TO_REMOTE_STATE_FILE))
 	} else {
 		return nil, nil
 	}

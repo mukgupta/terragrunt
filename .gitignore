@@ -1,3 +1,9 @@
+.*.sw?
 .idea
+terragrunt.iml
 vendor
-.terragrunt
+.terraform
+.vscode
+*.tfstate
+*.tfstate.backup
+*.out
